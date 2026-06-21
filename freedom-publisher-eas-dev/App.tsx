@@ -155,10 +155,6 @@ function allFourLinks(s: ClipStatus): boolean {
   return Boolean(s.links.tiktok && s.links.instagram && s.links.youtube && s.links.x);
 }
 
-function githubPathForUrl(path: string): string {
-  return path.split("/").map(encodeURIComponent).join("/");
-}
-
 function buildMarkdown(statuses: ClipStatus[], settings: Settings): string {
   const rows = statuses
     .filter((x) => x.done || isPublished(x))
@@ -196,26 +192,131 @@ Languages: ${languages || ""}
 - Tomorrow:
 `;
 }
+//github edits
+function githubPathForUrl(path: string): string {
+  return path
+    .trim()
+    .replace(/^\/+/, "")
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+}
+
+function githubHeaders(settings: Settings): Record<string, string> {
+  return {
+    Authorization: `Bearer ${settings.githubToken.trim()}`,
+    Accept: "application/vnd.github+json",
+    "Content-Type": "application/json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+}
+
+async function readResponseText(res: Response): Promise<string> {
+  try {
+    return await res.text();
+  } catch {
+    return "";
+  }
+}
 
 async function getGithubFileSha(settings: Settings): Promise<string | null> {
-  const path = githubPathForUrl(settings.githubLogPath);
-  const url = `https://api.github.com/repos/${settings.githubOwner}/${settings.githubRepo}/contents/${path}?ref=${encodeURIComponent(settings.githubBranch)}`;
-
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${settings.githubToken}`,
-      Accept: "application/vnd.github+json",
-    },
-  });
-
-  if (res.status === 404) return null;
-
-  if (!res.ok) {
-    throw new Error(`GitHub GET failed: ${res.status} ${await res.text()}`);
+  if (!settings.githubToken.trim()) {
+    throw new Error("GitHub token is empty. Open Settings and paste fine-grained PAT.");
   }
 
-  const json = await res.json();
-  return json.sha || null;
+  const path = githubPathForUrl(settings.githubLogPath);
+  const branch = encodeURIComponent(settings.githubBranch.trim() || "main");
+
+  const url =
+    `https://api.github.com/repos/` +
+    `${encodeURIComponent(settings.githubOwner.trim())}/` +
+    `${encodeURIComponent(settings.githubRepo.trim())}/` +
+    `contents/${path}?ref=${branch}`;
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers: githubHeaders(settings),
+  });
+
+  const text = await readResponseText(res);
+
+  if (res.status === 404) {
+    return null;
+  }
+
+  if (!res.ok) {
+    throw new Error(`GitHub GET failed: ${res.status} ${text}`);
+  }
+
+  let json: any;
+
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`GitHub GET returned non-JSON response: ${text.slice(0, 500)}`);
+  }
+
+  if (Array.isArray(json)) {
+    throw new Error(
+      `GitHub path points to a directory, not a file: ${settings.githubLogPath}`
+    );
+  }
+
+  if (json.type && json.type !== "file") {
+    throw new Error(
+      `GitHub path is not a file. type=${json.type}, path=${settings.githubLogPath}`
+    );
+  }
+
+  if (!json.sha) {
+    throw new Error(
+      `GitHub file exists but response has no sha. Response: ${JSON.stringify(json).slice(0, 800)}`
+    );
+  }
+
+  return json.sha;
+}
+
+async function putGithubMarkdownOnce(
+  settings: Settings,
+  markdown: string,
+  sha: string | null
+): Promise<{ ok: true } | { ok: false; status: number; text: string }> {
+  const path = githubPathForUrl(settings.githubLogPath);
+
+  const url =
+    `https://api.github.com/repos/` +
+    `${encodeURIComponent(settings.githubOwner.trim())}/` +
+    `${encodeURIComponent(settings.githubRepo.trim())}/` +
+    `contents/${path}`;
+
+  const body: any = {
+    message: `Update ${settings.githubLogPath}`,
+    content: Base64.encode(markdown),
+    branch: settings.githubBranch.trim() || "main",
+  };
+
+  if (sha) {
+    body.sha = sha;
+  }
+
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: githubHeaders(settings),
+    body: JSON.stringify(body),
+  });
+
+  const text = await readResponseText(res);
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      text,
+    };
+  }
+
+  return { ok: true };
 }
 
 async function updateGithubMarkdown(settings: Settings, markdown: string): Promise<void> {
@@ -223,31 +324,45 @@ async function updateGithubMarkdown(settings: Settings, markdown: string): Promi
     throw new Error("GitHub token is empty. Open Settings and paste fine-grained PAT.");
   }
 
-  const sha = await getGithubFileSha(settings);
-  const path = githubPathForUrl(settings.githubLogPath);
-  const url = `https://api.github.com/repos/${settings.githubOwner}/${settings.githubRepo}/contents/${path}`;
+  const initialSha = await getGithubFileSha(settings);
+  const firstTry = await putGithubMarkdownOnce(settings, markdown, initialSha);
 
-  const body: any = {
-    message: `Update ${settings.githubLogPath}`,
-    content: Base64.encode(markdown),
-    branch: settings.githubBranch,
-  };
-
-  if (sha) body.sha = sha;
-
-  const res = await fetch(url, {
-    method: "PUT",
-    headers: {
-      Authorization: `Bearer ${settings.githubToken}`,
-      Accept: "application/vnd.github+json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    throw new Error(`GitHub PUT failed: ${res.status} ${await res.text()}`);
+  if (firstTry.ok) {
+    return;
   }
+
+  const missingSha =
+    firstTry.status === 422 &&
+    firstTry.text.includes("sha") &&
+    firstTry.text.includes("wasn't supplied");
+
+  if (missingSha) {
+    /*
+      GitHub says the file exists, but our first SHA fetch did not attach it.
+      Fetch SHA again and retry once.
+    */
+    const retrySha = await getGithubFileSha(settings);
+
+    if (!retrySha) {
+      throw new Error(
+        `GitHub says file exists and requires sha, but GET returned no sha. ` +
+          `Check path="${settings.githubLogPath}", branch="${settings.githubBranch}". ` +
+          `Original PUT error: ${firstTry.status} ${firstTry.text}`
+      );
+    }
+
+    const secondTry = await putGithubMarkdownOnce(settings, markdown, retrySha);
+
+    if (secondTry.ok) {
+      return;
+    }
+
+    throw new Error(
+      `GitHub PUT retry with sha failed: ${secondTry.status} ${secondTry.text}`
+    );
+  }
+
+  throw new Error(`GitHub PUT failed: ${firstTry.status} ${firstTry.text}`);
 }
 
 export default function App() {
