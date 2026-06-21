@@ -192,11 +192,13 @@ Languages: ${languages || ""}
 - Tomorrow:
 `;
 }
-//github edits
+//github edits v2
+function normalizeGithubPath(path: string): string {
+  return path.trim().replace(/^\/+/, "");
+}
+
 function githubPathForUrl(path: string): string {
-  return path
-    .trim()
-    .replace(/^\/+/, "")
+  return normalizeGithubPath(path)
     .split("/")
     .map(encodeURIComponent)
     .join("/");
@@ -219,20 +221,7 @@ async function readResponseText(res: Response): Promise<string> {
   }
 }
 
-async function getGithubFileSha(settings: Settings): Promise<string | null> {
-  if (!settings.githubToken.trim()) {
-    throw new Error("GitHub token is empty. Open Settings and paste fine-grained PAT.");
-  }
-
-  const path = githubPathForUrl(settings.githubLogPath);
-  const branch = encodeURIComponent(settings.githubBranch.trim() || "main");
-
-  const url =
-    `https://api.github.com/repos/` +
-    `${encodeURIComponent(settings.githubOwner.trim())}/` +
-    `${encodeURIComponent(settings.githubRepo.trim())}/` +
-    `contents/${path}?ref=${branch}`;
-
+async function githubGetJson(settings: Settings, url: string): Promise<any> {
   const res = await fetch(url, {
     method: "GET",
     headers: githubHeaders(settings),
@@ -240,41 +229,102 @@ async function getGithubFileSha(settings: Settings): Promise<string | null> {
 
   const text = await readResponseText(res);
 
-  if (res.status === 404) {
-    return null;
-  }
-
   if (!res.ok) {
     throw new Error(`GitHub GET failed: ${res.status} ${text}`);
   }
 
-  let json: any;
-
   try {
-    json = JSON.parse(text);
+    return JSON.parse(text);
   } catch {
-    throw new Error(`GitHub GET returned non-JSON response: ${text.slice(0, 500)}`);
+    throw new Error(`GitHub GET returned non-JSON response: ${text.slice(0, 800)}`);
+  }
+}
+
+/*
+  Robust SHA lookup.
+
+  Why not only /contents/{path}?
+  On some mobile/token/path cases it may return 404/no sha,
+  while PUT still says the file exists and requires sha.
+
+  So we:
+  1. Try Contents API.
+  2. If no sha, use Git refs + recursive tree and find the file blob.
+*/
+async function getGithubFileSha(settings: Settings): Promise<string | null> {
+  if (!settings.githubToken.trim()) {
+    throw new Error("GitHub token is empty. Open Settings and paste fine-grained PAT.");
   }
 
-  if (Array.isArray(json)) {
+  const owner = encodeURIComponent(settings.githubOwner.trim());
+  const repo = encodeURIComponent(settings.githubRepo.trim());
+  const branch = encodeURIComponent(settings.githubBranch.trim() || "main");
+  const normalizedPath = normalizeGithubPath(settings.githubLogPath);
+  const encodedPath = githubPathForUrl(normalizedPath);
+
+  // Attempt 1: Contents API
+  try {
+    const contentsUrl =
+      `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}?ref=${branch}`;
+
+    const contentsRes = await fetch(contentsUrl, {
+      method: "GET",
+      headers: githubHeaders(settings),
+    });
+
+    const contentsText = await readResponseText(contentsRes);
+
+    if (contentsRes.status === 404) {
+      // File may not exist OR contents endpoint did not see it.
+      // Continue to tree fallback.
+    } else if (!contentsRes.ok) {
+      throw new Error(`GitHub contents GET failed: ${contentsRes.status} ${contentsText}`);
+    } else {
+      const json = JSON.parse(contentsText);
+
+      if (!Array.isArray(json) && json.sha && json.type === "file") {
+        return json.sha;
+      }
+    }
+  } catch (e) {
+    // Do not fail yet. Tree fallback is more robust.
+  }
+
+  // Attempt 2: Git Tree API fallback
+  const refUrl =
+    `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${branch}`;
+
+  const refJson = await githubGetJson(settings, refUrl);
+  const commitSha = refJson?.object?.sha;
+
+  if (!commitSha) {
+    throw new Error(`Could not get branch commit SHA for branch=${settings.githubBranch}`);
+  }
+
+  const treeUrl =
+    `https://api.github.com/repos/${owner}/${repo}/git/trees/${commitSha}?recursive=1`;
+
+  const treeJson = await githubGetJson(settings, treeUrl);
+  const tree = Array.isArray(treeJson?.tree) ? treeJson.tree : [];
+
+  const item = tree.find(
+    (x: any) =>
+      x &&
+      x.type === "blob" &&
+      String(x.path) === normalizedPath
+  );
+
+  if (!item) {
+    return null;
+  }
+
+  if (!item.sha) {
     throw new Error(
-      `GitHub path points to a directory, not a file: ${settings.githubLogPath}`
+      `Tree item found but has no sha for path=${normalizedPath}. Item=${JSON.stringify(item)}`
     );
   }
 
-  if (json.type && json.type !== "file") {
-    throw new Error(
-      `GitHub path is not a file. type=${json.type}, path=${settings.githubLogPath}`
-    );
-  }
-
-  if (!json.sha) {
-    throw new Error(
-      `GitHub file exists but response has no sha. Response: ${JSON.stringify(json).slice(0, 800)}`
-    );
-  }
-
-  return json.sha;
+  return item.sha;
 }
 
 async function putGithubMarkdownOnce(
@@ -282,13 +332,12 @@ async function putGithubMarkdownOnce(
   markdown: string,
   sha: string | null
 ): Promise<{ ok: true } | { ok: false; status: number; text: string }> {
+  const owner = encodeURIComponent(settings.githubOwner.trim());
+  const repo = encodeURIComponent(settings.githubRepo.trim());
   const path = githubPathForUrl(settings.githubLogPath);
 
   const url =
-    `https://api.github.com/repos/` +
-    `${encodeURIComponent(settings.githubOwner.trim())}/` +
-    `${encodeURIComponent(settings.githubRepo.trim())}/` +
-    `contents/${path}`;
+    `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
 
   const body: any = {
     message: `Update ${settings.githubLogPath}`,
@@ -324,29 +373,25 @@ async function updateGithubMarkdown(settings: Settings, markdown: string): Promi
     throw new Error("GitHub token is empty. Open Settings and paste fine-grained PAT.");
   }
 
-  const initialSha = await getGithubFileSha(settings);
-  const firstTry = await putGithubMarkdownOnce(settings, markdown, initialSha);
+  const sha = await getGithubFileSha(settings);
+  const firstTry = await putGithubMarkdownOnce(settings, markdown, sha);
 
   if (firstTry.ok) {
     return;
   }
 
-  const missingSha =
+  const needsSha =
     firstTry.status === 422 &&
-    firstTry.text.includes("sha") &&
-    firstTry.text.includes("wasn't supplied");
+    firstTry.text.toLowerCase().includes("sha");
 
-  if (missingSha) {
-    /*
-      GitHub says the file exists, but our first SHA fetch did not attach it.
-      Fetch SHA again and retry once.
-    */
+  if (needsSha) {
+    // File definitely exists, so fetch tree SHA again and retry.
     const retrySha = await getGithubFileSha(settings);
 
     if (!retrySha) {
       throw new Error(
-        `GitHub says file exists and requires sha, but GET returned no sha. ` +
-          `Check path="${settings.githubLogPath}", branch="${settings.githubBranch}". ` +
+        `GitHub says file exists and requires sha, but tree lookup did not find it. ` +
+          `Path="${settings.githubLogPath}", branch="${settings.githubBranch}". ` +
           `Original PUT error: ${firstTry.status} ${firstTry.text}`
       );
     }
@@ -357,9 +402,7 @@ async function updateGithubMarkdown(settings: Settings, markdown: string): Promi
       return;
     }
 
-    throw new Error(
-      `GitHub PUT retry with sha failed: ${secondTry.status} ${secondTry.text}`
-    );
+    throw new Error(`GitHub PUT retry with tree sha failed: ${secondTry.status} ${secondTry.text}`);
   }
 
   throw new Error(`GitHub PUT failed: ${firstTry.status} ${firstTry.text}`);
