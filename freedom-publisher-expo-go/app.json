@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "Freedom Publisher",
+    "slug": "freedom-publisher-expo-go",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "freedompublisher",
+    "userInterfaceStyle": "automatic",
+    "android": {
+      "package": "ai.freedomclips.publisher.expogo",
+      "permissions": [
+        "READ_MEDIA_VIDEO",
+        "READ_MEDIA_IMAGES",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Freedom Publisher to read videos for publishing queue.",
+          "savePhotosPermission": "Allow Freedom Publisher to move videos into Done album.",
+          "isAccessMediaLocationEnabled": false
+        }
+      ]
+    ]
+  }
+}
