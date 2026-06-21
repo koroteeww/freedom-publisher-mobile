@@ -2,7 +2,7 @@
   "expo": {
     "name": "Freedom Publisher",
     "slug": "freedom-publisher-eas-dev",
-    "version": "0.1.0",
+    "version": "0.5.0",
     "orientation": "portrait",
     "scheme": "freedompublisher",
     "userInterfaceStyle": "automatic",
