@@ -1,0 +1,27 @@
+{
+  "version": "0.1.0",
+  "private": true,
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "start:dev": "expo start --dev-client --tunnel",
+    "build:dev": "eas build -p android --profile development",
+    "build:apk": "eas build -p android --profile preview"
+  },
+  "dependencies": {
+    "expo": "latest",
+    "expo-clipboard": "latest",
+    "expo-media-library": "latest",
+    "expo-sharing": "latest",
+    "@react-native-async-storage/async-storage": "latest",
+    "js-base64": "^3.7.7",
+    "react": "latest",
+    "react-native": "latest",
+    "expo-dev-client": "latest"
+  },
+  "devDependencies": {
+    "typescript": "latest",
+    "@types/react": "latest"
+  },
+  "name": "freedom-publisher-eas-dev"
+}
